@@ -4,7 +4,7 @@ use crate::error::Error;
 ///
 /// The generic specifies how many bits are used to create the buckets. The number of buckets is
 /// 2 ^ bits.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Buckets<const N: u8>(pub(crate) Vec<u64>);
 
 impl<const N: u8> Buckets<N> {
@@ -14,7 +14,7 @@ impl<const N: u8> Buckets<N> {
     }
 
     pub fn put(&mut self, bucket: usize, offset: u64) -> Result<(), Error> {
-        if bucket > (1 << N) - 1 {
+        if bucket > Self::max_size() - 1 {
             return Err(Error::BucketsOutOfBounds);
         }
         self.0[bucket] = offset;
@@ -22,16 +22,20 @@ impl<const N: u8> Buckets<N> {
     }
 
     pub fn get(&self, bucket: usize) -> Result<u64, Error> {
-        if bucket > (1 << N) - 1 {
+        if bucket > Self::max_size() - 1 {
             return Err(Error::BucketsOutOfBounds);
         }
         Ok(self.0[bucket])
+    }
+
+    const fn max_size() -> usize {
+        1 << N
     }
 }
 
 impl<const N: u8> Default for Buckets<N> {
     fn default() -> Self {
-        Self(vec![0; 1 << N])
+        Self(vec![0; Self::max_size()])
     }
 }
 

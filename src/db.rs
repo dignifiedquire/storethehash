@@ -6,24 +6,30 @@
 use std::path::Path;
 
 use crate::error::Error;
-use crate::index::Index;
+use crate::index::{Index, IndexFileStorage, IndexStorage};
 use crate::primary::PrimaryStorage;
 
 /// A database to store and retrive key-value pairs.
 #[derive(Debug)]
-pub struct Db<P: PrimaryStorage, const N: u8> {
-    index: Index<P, N>,
+pub struct Db<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> {
+    index: Index<P, I, N>,
 }
 
-impl<P: PrimaryStorage, const N: u8> Db<P, N> {
+impl<P: PrimaryStorage, const N: u8> Db<P, IndexFileStorage<N>, N> {
     pub fn open<T>(primary: P, index_path: T) -> Result<Self, Error>
     where
         T: AsRef<Path>,
     {
-        let index = Index::<_, N>::open(index_path, primary)?;
+        let index = Index::<_, _, N>::open(index_path, primary)?;
         Ok(Self { index })
     }
+}
 
+impl<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> Db<P, I, N> {
+    pub fn new(primary: P, storage: I) -> Result<Self, Error> {
+        let index = Index::<_, _, N>::new(storage, primary)?;
+        Ok(Self { index })
+    }
     /// Returns the value of the given key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let index_key = P::index_key(&key)?;

@@ -2,7 +2,9 @@ use std::convert::TryInto;
 use std::fs::{self, File};
 use std::path::Path;
 
-use storethehash::index::{self, Header, Index, IndexIter, INDEX_VERSION};
+use storethehash::index::{
+    self, Header, Index, IndexFileStorage, IndexIter, IndexMemoryStorage, INDEX_VERSION,
+};
 use storethehash::recordlist::RecordList;
 use storethehash_primary_inmemory::InMemory;
 
@@ -25,20 +27,22 @@ fn assert_common_prefix_trimmed(key1: Vec<u8>, key2: Vec<u8>, expected_key_lengt
     let primary_storage = InMemory::new(&[(key1.clone(), vec![0x20]), (key2.clone(), vec![0x30])]);
     let temp_dir = tempfile::tempdir().unwrap();
     let index_path = temp_dir.path().join("storethehash.index");
-    let index = Index::<_, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
+    let index = Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(
+        &index_path,
+        primary_storage,
+    )
+    .unwrap();
     index.put(&key1, 0).unwrap();
     index.put(&key2, 1).unwrap();
 
     // Skip header
-    let mut file = File::open(index_path).unwrap();
-    let (_header, bytes_read) = index::read_header(&mut file).unwrap();
+    let file = File::open(index_path).unwrap();
+    let file = io_streams::StreamWriter::file(file);
+    let (_header, bytes_read) = index::read_header(&file).unwrap();
 
     // The record list is append only, hence the first record list only contains the first insert
     {
-        let (data, _pos) = IndexIter::new(&mut file, bytes_read)
-            .next()
-            .unwrap()
-            .unwrap();
+        let (data, _pos) = IndexIter::new(&file, bytes_read).next().unwrap().unwrap();
         let recordlist = RecordList::new(&data);
         let keys: Vec<usize> = recordlist
             .into_iter()
@@ -49,10 +53,7 @@ fn assert_common_prefix_trimmed(key1: Vec<u8>, key2: Vec<u8>, expected_key_lengt
 
     // The second block contains both keys
     {
-        let (data, _pos) = IndexIter::new(&mut file, bytes_read)
-            .next()
-            .unwrap()
-            .unwrap();
+        let (data, _pos) = IndexIter::new(&file, bytes_read).next().unwrap().unwrap();
         let recordlist = RecordList::new(&data);
         let keys: Vec<usize> = recordlist
             .into_iter()
@@ -74,17 +75,19 @@ fn index_put_single_key() {
     let primary_storage = InMemory::new(&[]);
     let temp_dir = tempfile::tempdir().unwrap();
     let index_path = temp_dir.path().join("storethehash.index");
-    let index = Index::<_, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
+    let index = Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(
+        &index_path,
+        primary_storage,
+    )
+    .unwrap();
     index.put(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 222).unwrap();
 
     // Skip header
-    let mut file = File::open(index_path).unwrap();
-    let (_header, bytes_read) = index::read_header(&mut file).unwrap();
+    let file = File::open(index_path).unwrap();
+    let file = io_streams::StreamWriter::file(file);
+    let (_header, bytes_read) = index::read_header(&file).unwrap();
 
-    let (data, _pos) = IndexIter::new(&mut file, bytes_read)
-        .next()
-        .unwrap()
-        .unwrap();
+    let (data, _pos) = IndexIter::new(&file, bytes_read).next().unwrap().unwrap();
     let recordlist = RecordList::new(&data);
     let record = recordlist.into_iter().next().unwrap();
     assert_eq!(
@@ -102,18 +105,16 @@ fn index_put_distinct_key() {
     let primary_storage = InMemory::new(&[]);
     let temp_dir = tempfile::tempdir().unwrap();
     let index_path = temp_dir.path().join("storethehash.index");
-    let index = Index::<_, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
+    let index = Index::<_, _, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
     index.put(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 222).unwrap();
     index.put(&[1, 2, 3, 55, 5, 6, 7, 8, 9, 10], 333).unwrap();
 
     // Skip header
-    let mut file = File::open(index_path).unwrap();
-    let (_header, bytes_read) = index::read_header(&mut file).unwrap();
+    let file = File::open(index_path).unwrap();
+    let file = io_streams::StreamWriter::file(file);
+    let (_header, bytes_read) = index::read_header(&file).unwrap();
 
-    let (data, _pos) = IndexIter::new(&mut file, bytes_read)
-        .last()
-        .unwrap()
-        .unwrap();
+    let (data, _pos) = IndexIter::new(&file, bytes_read).last().unwrap().unwrap();
     let recordlist = RecordList::new(&data);
     let keys: Vec<Vec<u8>> = recordlist
         .into_iter()
@@ -156,19 +157,21 @@ fn index_put_prev_and_next_key_common_prefix() {
     ]);
     let temp_dir = tempfile::tempdir().unwrap();
     let index_path = temp_dir.path().join("storethehash.index");
-    let index = Index::<_, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
+    let index = Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(
+        &index_path,
+        primary_storage,
+    )
+    .unwrap();
     index.put(&key1, 0).unwrap();
     index.put(&key2, 1).unwrap();
     index.put(&key3, 1).unwrap();
 
     // Skip header
-    let mut file = File::open(index_path).unwrap();
-    let (_header, bytes_read) = index::read_header(&mut file).unwrap();
+    let file = File::open(index_path).unwrap();
+    let file = io_streams::StreamWriter::file(file);
+    let (_header, bytes_read) = index::read_header(&file).unwrap();
 
-    let (data, _pos) = IndexIter::new(&mut file, bytes_read)
-        .last()
-        .unwrap()
-        .unwrap();
+    let (data, _pos) = IndexIter::new(&file, bytes_read).last().unwrap().unwrap();
     let recordlist = RecordList::new(&data);
     let keys: Vec<Vec<u8>> = recordlist
         .into_iter()
@@ -188,7 +191,11 @@ fn index_get_empty_index() {
     let primary_storage = InMemory::new(&[]);
     let temp_dir = tempfile::tempdir().unwrap();
     let index_path = temp_dir.path().join("storethehash.index");
-    let index = Index::<_, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
+    let index = Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(
+        &index_path,
+        primary_storage,
+    )
+    .unwrap();
     let file_offset = index.get(&key).unwrap();
     assert_eq!(file_offset, None, "Key was not found");
 }
@@ -207,7 +214,50 @@ fn index_get() {
     ]);
     let temp_dir = tempfile::tempdir().unwrap();
     let index_path = temp_dir.path().join("storethehash.index");
-    let index = Index::<_, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
+    let index = Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(
+        &index_path,
+        primary_storage,
+    )
+    .unwrap();
+    index.put(&key1, 0).unwrap();
+    index.put(&key2, 1).unwrap();
+    index.put(&key3, 2).unwrap();
+
+    let first_key_file_offset = index.get(&key1).unwrap();
+    assert_eq!(first_key_file_offset, Some(0));
+
+    let second_key_file_offset = index.get(&key2).unwrap();
+    assert_eq!(second_key_file_offset, Some(1));
+
+    let third_key_file_offset = index.get(&key3).unwrap();
+    assert_eq!(third_key_file_offset, Some(2));
+
+    // It still hits a bucket where there are keys, but that key doesn't exist.
+    let not_found_in_bucket = index.get(&[1, 2, 3, 4, 5, 9]).unwrap();
+    assert_eq!(not_found_in_bucket, None);
+
+    // A key that matches some prefixes but it shorter than the prefixes.
+    let shorter_than_prefixes = index.get(&[1, 2, 3, 4, 5]).unwrap();
+    assert_eq!(shorter_than_prefixes, None);
+}
+
+#[test]
+fn index_get_memory() {
+    let key1 = vec![1, 2, 3, 4, 5, 6, 9, 9, 9, 9];
+    let key2 = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let key3 = vec![1, 2, 3, 4, 5, 6, 9, 8, 8, 8];
+
+    const BUCKETS_BITS: u8 = 24;
+    let primary_storage = InMemory::new(&[
+        (key1.clone(), vec![0x10]),
+        (key2.clone(), vec![0x20]),
+        (key3.clone(), vec![0x30]),
+    ]);
+    let index = Index::<_, IndexMemoryStorage<BUCKETS_BITS>, BUCKETS_BITS>::new(
+        IndexMemoryStorage::new(),
+        primary_storage,
+    )
+    .unwrap();
     index.put(&key1, 0).unwrap();
     index.put(&key2, 1).unwrap();
     index.put(&key3, 2).unwrap();
@@ -238,13 +288,21 @@ fn index_header() {
 
     {
         let primary_storage = InMemory::new(&[]);
-        let _index = Index::<_, BUCKETS_BITS>::open(&index_path, primary_storage).unwrap();
+        let _index = Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(
+            &index_path,
+            primary_storage,
+        )
+        .unwrap();
         assert_header(&index_path, BUCKETS_BITS);
     }
 
     // Check that the header doesn't change if the index is opened again.
     {
-        let _index = Index::<_, BUCKETS_BITS>::open(&index_path, InMemory::new(&[])).unwrap();
+        let _index = Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(
+            &index_path,
+            InMemory::new(&[]),
+        )
+        .unwrap();
         assert_header(&index_path, BUCKETS_BITS);
     }
 }

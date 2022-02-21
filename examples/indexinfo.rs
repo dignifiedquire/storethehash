@@ -1,19 +1,18 @@
 use std::convert::TryInto;
 use std::env;
 use std::fs::File;
-use std::io::BufReader;
 
 use storethehash::index::{self, IndexIter};
 use storethehash::recordlist::{RecordList, BUCKET_PREFIX_SIZE};
 
 fn index_info(index_path: &str) {
-    let mut index_file = File::open(&index_path).unwrap();
+    let index_file = File::open(&index_path).unwrap();
+    let index_file = io_streams::StreamWriter::file(index_file);
 
     // Skip the header
-    let (_header, bytes_read) = index::read_header(&mut index_file).unwrap();
+    let (_header, bytes_read) = index::read_header(&index_file).unwrap();
 
-    let mut buffered = BufReader::new(index_file);
-    for entry in IndexIter::new(&mut buffered, bytes_read) {
+    for entry in IndexIter::new(&index_file, bytes_read) {
         match entry {
             Ok((data, _pos)) => {
                 let bucket = u32::from_le_bytes(data[..BUCKET_PREFIX_SIZE].try_into().unwrap());
@@ -33,7 +32,7 @@ fn index_info(index_path: &str) {
 
                 println!("{}: {}", bucket, keys.join(" "));
             }
-            Err(error) => panic!(error),
+            Err(error) => panic!("{}", error),
         }
     }
 }

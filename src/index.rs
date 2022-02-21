@@ -11,11 +11,12 @@
 use std::cell::RefCell;
 use std::cmp;
 use std::convert::{TryFrom, TryInto};
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs::OpenOptions;
+use std::io::{self, BufWriter, SeekFrom, Write};
 use std::path::Path;
 
 use log::{debug, warn};
+use system_interface::fs::FileIoExt;
 
 use crate::buckets::Buckets;
 use crate::error::Error;
@@ -74,72 +75,145 @@ impl From<&[u8]> for Header {
     }
 }
 
-#[derive(Debug)]
-pub struct Index<P: PrimaryStorage, const N: u8> {
-    buckets: RefCell<Buckets<N>>,
-    reader: File,
-    writer: RefCell<BufWriter<File>>,
-    pub primary: P,
+pub trait IndexStorage<const N: u8> {
+    fn load_buckets(&self) -> Result<Buckets<N>, Error>;
+    fn get_record_list_buffer(&self, pos: u64) -> Result<Vec<u8>, Error>;
+    fn write_record_list(&self, bucket: u32, data: &[u8]) -> Result<u64, Error>;
 }
 
-impl<P: PrimaryStorage, const N: u8> Index<P, N> {
-    /// Open and index.
-    ///
-    /// It is created if there is no existing index at that path.
-    pub fn open<T>(path: T, primary: P) -> Result<Self, Error>
+pub struct IndexMemoryStorage<const N: u8> {
+    records: RefCell<Vec<Vec<u8>>>,
+}
+
+impl<const N: u8> IndexMemoryStorage<N> {
+    pub fn new() -> Self {
+        IndexMemoryStorage {
+            // empty record at the beginning to avoid index_offset 0
+            records: RefCell::new(vec![vec![0u8]]),
+        }
+    }
+}
+
+impl<const N: u8> IndexStorage<N> for IndexMemoryStorage<N> {
+    fn load_buckets(&self) -> Result<Buckets<N>, Error> {
+        Ok(Buckets::new())
+    }
+
+    fn get_record_list_buffer(&self, pos: u64) -> Result<Vec<u8>, Error> {
+        let pos = usize::try_from(pos).unwrap();
+        Ok(self.records.borrow()[pos].clone())
+    }
+
+    fn write_record_list(&self, bucket: u32, data: &[u8]) -> Result<u64, Error> {
+        let pos = self.records.borrow().len();
+        let mut buf = vec![0u8; BUCKET_PREFIX_SIZE + data.len()];
+        buf[..BUCKET_PREFIX_SIZE].copy_from_slice(&bucket.to_le_bytes());
+        buf[BUCKET_PREFIX_SIZE..].copy_from_slice(data);
+
+        self.records.borrow_mut().push(buf);
+        Ok(pos as u64)
+    }
+}
+
+pub struct IndexFileStorage<const N: u8> {
+    file: RefCell<BufWriter<io_streams::StreamWriter>>,
+}
+
+impl<const N: u8> IndexStorage<N> for IndexFileStorage<N> {
+    fn load_buckets(&self) -> Result<Buckets<N>, Error> {
+        let mut file = self.file.borrow_mut();
+        file.get_mut().seek(SeekFrom::Start(0))?;
+        // Read the header to determine whether the index was created with a different bit
+        // size for the buckets
+        let (header, bytes_read) = read_header(file.get_ref())?;
+        if header.buckets_bits != N {
+            return Err(Error::IndexWrongBitSize(header.buckets_bits, N));
+        }
+
+        debug!("Initalize buckets.");
+        // Fill up the in-memory buckets with the data from the index
+        let mut buckets = Buckets::<N>::new();
+        // TODO vmx 2020-11-30: Find if there's a better way than cloning the file. Perhaps
+        // a BufReader should be used instead of File for this whole module?
+        for entry in IndexIter::new(file.get_ref(), bytes_read) {
+            match entry {
+                Ok((data, pos)) => {
+                    let bucket_prefix = u32::from_le_bytes(
+                        data[..BUCKET_PREFIX_SIZE]
+                            .try_into()
+                            .expect("Slice is guaranteed to be exactly 4 bytes"),
+                    );
+                    let bucket = usize::try_from(bucket_prefix).expect(">=32-bit platform needed");
+                    buckets
+                        .put(bucket, pos)
+                        .expect("Cannot be out of bounds as it was materialized before");
+                }
+                // The file is corrupt. Though it's not a problem, just take the data we
+                // are able to use and move on.
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    //return Err(Error::IndexCorrupt);
+                    warn!("Index file is corrupt.");
+                    file.get_mut().seek(SeekFrom::End(0))?;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        debug!("Intialize buckets done.");
+
+        Ok(buckets)
+    }
+
+    fn get_record_list_buffer(&self, pos: u64) -> Result<Vec<u8>, Error> {
+        let mut reader = self.file.borrow_mut();
+        let mut recordlist_size_buffer = [0; 4];
+        reader.get_mut().seek(SeekFrom::Start(pos))?;
+        reader.get_ref().read_exact(&mut recordlist_size_buffer)?;
+
+        let recordlist_size = usize::try_from(u32::from_le_bytes(recordlist_size_buffer))
+            .expect(">=32-bit platform needed");
+
+        let mut data = vec![0u8; recordlist_size];
+        reader.get_ref().read_exact(&mut data)?;
+        Ok(data)
+    }
+
+    fn write_record_list(&self, bucket: u32, data: &[u8]) -> Result<u64, Error> {
+        let writer = &mut *self.file.borrow_mut();
+        let recordlist_pos = writer
+            .get_mut()
+            .seek(SeekFrom::End(0))
+            .expect("It's always possible to seek to the end of the file.");
+
+        // Write new data to disk. The record list is prefixed with bucket they are in. This is
+        // needed in order to reconstruct the in-memory buckets from the index itself.
+        // TODO vmx 2020-11-25: This should be an error and not a panic
+        let new_data_size: [u8; 4] = u32::try_from(data.len() + BUCKET_PREFIX_SIZE)
+            .expect("A record list cannot be bigger than 2^32.")
+            .to_le_bytes();
+        writer.write_all(&new_data_size)?;
+        writer.write_all(&bucket.to_le_bytes())?;
+        writer.write_all(&data)?;
+        // Fsyncs are expensive
+        writer.flush()?;
+
+        Ok(recordlist_pos)
+    }
+}
+
+impl<const N: u8> IndexFileStorage<N> {
+    pub fn open<T>(path: T) -> Result<Self, Error>
     where
         T: AsRef<Path>,
     {
         let index_path = path.as_ref();
         let mut options = OpenOptions::new();
-        let options = options.read(true).append(true);
+        let options = options.read(true).write(true).append(true);
         debug!("Opening index file: {:?}", &index_path);
-        let (index_file, buckets) = match options.open(index_path) {
+        let file = match options.open(index_path) {
             // If an existing file is opened, recreate the in-memory [`Buckets']
-            Ok(mut file) => {
-                // Read the header to determine whether the index was created with a different bit
-                // size for the buckets
-                let (header, bytes_read) = read_header(&mut file)?;
-                if header.buckets_bits != N {
-                    return Err(Error::IndexWrongBitSize(header.buckets_bits, N));
-                }
-
-                debug!("Initalize buckets.");
-                // Fill up the in-memory buckets with the data from the index
-                let mut buckets = Buckets::<N>::new();
-                // TODO vmx 2020-11-30: Find if there's a better way than cloning the file. Perhaps
-                // a BufReader should be used instead of File for this whole module?
-                let mut buffered = BufReader::new(file.try_clone()?);
-                for entry in IndexIter::new(&mut buffered, bytes_read) {
-                    match entry {
-                        Ok((data, pos)) => {
-                            let bucket_prefix = u32::from_le_bytes(
-                                data[..BUCKET_PREFIX_SIZE]
-                                    .try_into()
-                                    .expect("Slice is guaranteed to be exactly 4 bytes"),
-                            );
-                            let bucket =
-                                usize::try_from(bucket_prefix).expect(">=32-bit platform needed");
-                            buckets
-                                .put(bucket, pos)
-                                .expect("Cannot be out of bounds as it was materialized before");
-                        }
-                        // The file is corrupt. Though it's not a problem, just take the data we
-                        // are able to use and move on.
-                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            //return Err(Error::IndexCorrupt);
-                            warn!("Index file is corrupt.");
-                            file.seek(SeekFrom::End(0))?;
-                            break;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-
-                debug!("Intialize buckets done.");
-
-                (file, buckets)
-            }
+            Ok(file) => BufWriter::new(io_streams::StreamWriter::file(file)),
             // If the file doesn't exist yet create it with the correct header
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 debug!("Create new index.");
@@ -148,19 +222,49 @@ impl<P: PrimaryStorage, const N: u8> Index<P, N> {
                     .expect("A header cannot be bigger than 2^32.")
                     .to_le_bytes();
 
-                let mut file = options.create(true).open(index_path)?;
+                let file = options.create(true).open(index_path)?;
+                let mut file = BufWriter::new(io_streams::StreamWriter::file(file));
                 file.write_all(&header_size)?;
                 file.write_all(&header)?;
-                file.sync_data()?;
-                (file, Buckets::<N>::new())
+                file.flush()?;
+                file
             }
             Err(error) => return Err(error.into()),
         };
 
+        Ok(IndexFileStorage {
+            file: RefCell::new(file),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct Index<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> {
+    buckets: RefCell<Buckets<N>>,
+    storage: I,
+    pub primary: P,
+}
+
+impl<P: PrimaryStorage, const N: u8> Index<P, IndexFileStorage<N>, N> {
+    /// Open and index.
+    ///
+    /// It is created if there is no existing index at that path.
+    pub fn open<T>(path: T, primary: P) -> Result<Self, Error>
+    where
+        T: AsRef<Path>,
+    {
+        let storage = IndexFileStorage::<N>::open(path)?;
+        Self::new(storage, primary)
+    }
+}
+
+impl<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> Index<P, I, N> {
+    pub fn new(storage: I, primary: P) -> Result<Self, Error> {
+        let buckets = storage.load_buckets()?;
+
         Ok(Self {
             buckets: RefCell::new(buckets),
-            reader: index_file.try_clone()?,
-            writer: RefCell::new(BufWriter::new(index_file)),
+            storage,
             primary,
         })
     }
@@ -185,10 +289,6 @@ impl<P: PrimaryStorage, const N: u8> Index<P, N> {
         // only full bytes are trimmed off.
         let index_key = strip_bucket_prefix(&key, N);
 
-        // Reading and seeking needs mutable file accesss.
-        let mut writer = self.writer.borrow_mut();
-        let mut reader = &self.reader;
-
         // No records stored in that bucket yet
         let new_data = if index_offset == 0 {
             // As it's the first key a single byte is enough as it doesn't need to be distinguised
@@ -198,15 +298,7 @@ impl<P: PrimaryStorage, const N: u8> Index<P, N> {
         }
         // Read the record list from disk and insert the new key
         else {
-            let mut recordlist_size_buffer = [0; 4];
-            reader.seek(SeekFrom::Start(index_offset))?;
-            reader.read_exact(&mut recordlist_size_buffer)?;
-            let recordlist_size = usize::try_from(u32::from_le_bytes(recordlist_size_buffer))
-                .expect(">=32-bit platform needed");
-
-            let mut data = vec![0u8; recordlist_size];
-            reader.read_exact(&mut data)?;
-
+            let data = self.storage.get_record_list_buffer(index_offset)?;
             let records = RecordList::new(&data);
             let (pos, prev_record) = records.find_key_position(index_key);
 
@@ -284,27 +376,12 @@ impl<P: PrimaryStorage, const N: u8> Index<P, N> {
             }
         };
 
-        let recordlist_pos = writer
-            .seek(SeekFrom::End(0))
-            .expect("It's always possible to seek to the end of the file.");
-
-        // Write new data to disk. The record list is prefixed with bucket they are in. This is
-        // needed in order to reconstruct the in-memory buckets from the index itself.
-        // TODO vmx 2020-11-25: This should be an error and not a panic
-        let new_data_size: [u8; 4] = u32::try_from(new_data.len() + BUCKET_PREFIX_SIZE)
-            .expect("A record list cannot be bigger than 2^32.")
-            .to_le_bytes();
-        writer.write_all(&new_data_size)?;
-        writer.write_all(&bucket.to_le_bytes())?;
-        writer.write_all(&new_data)?;
-        // Fsyncs are expensive
-        //self.file.sync_data()?;
+        let record_list_pos = self.storage.write_record_list(bucket, &new_data)?;
 
         // Keep the reference to the stored data in the bucket
         self.buckets
             .borrow_mut()
-            .put(bucket as usize, recordlist_pos)?;
-
+            .put(bucket as usize, record_list_pos)?;
         Ok(())
     }
 
@@ -332,16 +409,7 @@ impl<P: PrimaryStorage, const N: u8> Index<P, N> {
         // Read the record list from disk and get the file offset of that key in the primary
         // storage.
         else {
-            let mut recordlist_size_buffer = [0; 4];
-            let mut reader = &self.reader;
-            reader.seek(SeekFrom::Start(index_offset))?;
-            reader.read_exact(&mut recordlist_size_buffer)?;
-            let recordlist_size = usize::try_from(u32::from_le_bytes(recordlist_size_buffer))
-                .expect(">=32-bit platform needed");
-
-            let mut data = vec![0u8; recordlist_size];
-            reader.read_exact(&mut data)?;
-
+            let data = self.storage.get_record_list_buffer(index_offset)?;
             let records = RecordList::new(&data);
             let file_offset = records.get(index_key);
             Ok(file_offset)
@@ -359,24 +427,24 @@ impl<P: PrimaryStorage, const N: u8> Index<P, N> {
 /// On each iteration it returns the position of the record within the index together with the raw
 /// record list data.
 #[derive(Debug)]
-pub struct IndexIter<R: Read> {
+pub struct IndexIter<R> {
     /// The index data we are iterating over
     index: R,
     /// The current position within the index
     pos: usize,
 }
 
-impl<R: Read> IndexIter<R> {
+impl<R: FileIoExt> IndexIter<R> {
     pub fn new(index: R, pos: usize) -> Self {
         Self { index, pos }
     }
 }
 
-impl<R: Read + Seek> Iterator for IndexIter<R> {
+impl<R: FileIoExt> Iterator for IndexIter<R> {
     type Item = Result<(Vec<u8>, u64), io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match read_size_prefix(&mut self.index) {
+        match read_size_prefix(&self.index) {
             Ok(size) => {
                 let pos = u64::try_from(self.pos).expect("64-bit platform needed");
                 // Advance the position to the end of records list
@@ -398,7 +466,7 @@ impl<R: Read + Seek> Iterator for IndexIter<R> {
 }
 
 /// Only reads the size prefix of the data and returns it.
-pub fn read_size_prefix<R: Read>(reader: &mut R) -> Result<usize, io::Error> {
+pub fn read_size_prefix<R: FileIoExt>(reader: &R) -> Result<usize, io::Error> {
     let mut size_buffer = [0; SIZE_PREFIX_SIZE];
     reader.read_exact(&mut size_buffer)?;
     let size = usize::try_from(u32::from_le_bytes(size_buffer)).expect(">=32-bit platform needed");
@@ -409,7 +477,7 @@ pub fn read_size_prefix<R: Read>(reader: &mut R) -> Result<usize, io::Error> {
 ///
 /// The bytes read include all the bytes that were read by this function. Hence it also includes
 /// the 4-byte size prefix of the header besides the size of the header data itself.
-pub fn read_header(file: &mut File) -> Result<(Header, usize), io::Error> {
+pub fn read_header(file: &io_streams::StreamWriter) -> Result<(Header, usize), io::Error> {
     let mut header_size_buffer = [0; SIZE_PREFIX_SIZE];
     file.read_exact(&mut header_size_buffer)?;
     let header_size =

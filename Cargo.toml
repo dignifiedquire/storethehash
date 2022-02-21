@@ -12,6 +12,8 @@ categories = ["database-implementations"]
 [dependencies]
 thiserror = "1.0.22"
 log = "0.4.11"
+io-streams = "0.11.0"
+system-interface = "0.20.0"
 
 [dev-dependencies]
 tempfile = "3.1.0"
@@ -20,6 +22,8 @@ fil_logger = "0.1.2"
 serde_json = "1.0.59"
 storethehash-primary-cid = { version = "0.1.0", path = "primary/cid" }
 storethehash-primary-inmemory = { version = "0.1.0", path = "primary/inmemory" }
+criterion = "0.3.5"
+rand = "0.8.5"
 
 [workspace]
 members = [
@@ -27,3 +31,10 @@ members = [
   "primary/cid",
   "primary/inmemory",
 ]
+
+
+[[bench]]
+name = "fs"
+harness = false
+
+[features]

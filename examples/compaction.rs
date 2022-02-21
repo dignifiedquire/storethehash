@@ -1,19 +1,22 @@
 use std::convert::TryFrom;
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, SeekFrom};
 
 use log::{debug, info};
 
-use storethehash::index::{self, Index};
+use storethehash::index::{self, Index, IndexFileStorage};
 use storethehash_primary_inmemory::InMemory;
+use system_interface::fs::FileIoExt;
 
 const BUCKETS_BITS: u8 = 24;
 
 /// Returns the lowest offset of the index that is referred to in the buckets.
 fn get_lowest_file_offset(index_path: &str) -> u64 {
     let primary_storage = InMemory::new(&[]);
-    let index = Index::<_, BUCKETS_BITS>::open(index_path, primary_storage).unwrap();
+    let index =
+        Index::<_, IndexFileStorage<BUCKETS_BITS>, BUCKETS_BITS>::open(index_path, primary_storage)
+            .unwrap();
     let offsets = index.offsets();
     let lowest_file_offset = offsets.iter().min().unwrap();
     info!(
@@ -26,7 +29,9 @@ fn get_lowest_file_offset(index_path: &str) -> u64 {
 fn compaction(index_path: &str) {
     let lowest_file_offset = get_lowest_file_offset(index_path);
 
-    let mut index_file = OpenOptions::new().read(true).open(index_path).unwrap();
+    let index_file = OpenOptions::new().read(true).open(index_path).unwrap();
+    let index_file_writer = io_streams::StreamWriter::file(index_file.try_clone().unwrap());
+    let index_file_reader = io_streams::StreamReader::file(index_file.try_clone().unwrap());
 
     let compacted_path = format!("{}{}", index_path, ".compacted");
     info!("Compacted file path: {}", compacted_path);
@@ -39,19 +44,22 @@ fn compaction(index_path: &str) {
         .unwrap();
 
     // Copy the header.
-    let (_header, bytes_read_usize) = index::read_header(&mut index_file).unwrap();
+    let (_header, bytes_read_usize) = index::read_header(&index_file_writer).unwrap();
     let bytes_read = u64::try_from(bytes_read_usize).expect("64-bit platform needed");
-    index_file.seek(SeekFrom::Start(0)).unwrap();
-    let mut header_bytes = index_file.try_clone().unwrap().take(bytes_read);
+    index_file_reader.seek(SeekFrom::Start(0)).unwrap();
+    let mut header_bytes = vec![0u8; bytes_read as usize];
+    index_file_reader.read_exact(&mut header_bytes).unwrap();
+
     debug!("Copy {} header bytes.", bytes_read);
-    io::copy(&mut header_bytes, &mut compacted_file).unwrap();
+    compacted_file.write_all(&header_bytes).unwrap();
 
     // Copy the actual contents.
-    index_file
+    index_file_reader
         .seek(SeekFrom::Start(lowest_file_offset))
         .unwrap();
+    let mut index_file_buffer = std::io::BufReader::new(index_file_reader);
     debug!("Copy contents.");
-    io::copy(&mut index_file, &mut compacted_file).unwrap();
+    io::copy(&mut index_file_buffer, &mut compacted_file).unwrap();
     debug!("Compation done.");
 }
 

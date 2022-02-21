@@ -92,7 +92,7 @@ impl<R: Read> Iterator for CarIter<R> {
             }
             // We might have hit the end of the file => stop iterating
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => None,
-            Err(error) => panic!(error),
+            Err(error) => panic!("{}", error),
         }
     }
 }
