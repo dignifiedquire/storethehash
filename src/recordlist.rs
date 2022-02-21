@@ -3,6 +3,8 @@ use std::convert::TryInto;
 use std::io::{self, Read};
 use std::ops::Range;
 
+use bytes::Bytes;
+
 /// In how many bytes the bucket prefixes are stored.
 pub const BUCKET_PREFIX_SIZE: usize = 4;
 
@@ -34,18 +36,26 @@ pub struct Record<'a> {
 ///     | Bit value used to determine the bucket |     Record    | … |
 /// ```
 #[derive(Debug)]
-pub struct RecordList<'a> {
+pub struct RecordList {
     /// The bytes containing the records.
-    data: &'a [u8],
+    data: Bytes,
 }
 
-impl<'a> RecordList<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
+impl RecordList {
+    pub fn owned(data: Bytes) -> Self {
+        Self { data }
+    }
+
+    pub fn new(data: &[u8]) -> Self {
         // The record list itself doesn't care about the bits that were used to associate it with a
         // bucket, hence we just skip those.
         Self {
-            data: &data[BUCKET_PREFIX_SIZE..],
+            data: Bytes::copy_from_slice(&data[BUCKET_PREFIX_SIZE..]),
         }
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Finds the position where a key would be added.
@@ -62,7 +72,7 @@ impl<'a> RecordList<'a> {
             }
         }
 
-        (self.data.len(), prev_record)
+        (self.data().len(), prev_record)
     }
 
     /// Put keys at a certain position and return the new data.
@@ -75,18 +85,18 @@ impl<'a> RecordList<'a> {
     /// new key.
     pub fn put_keys(&self, keys: &[(&[u8], u64)], range: Range<usize>) -> Vec<u8> {
         let mut result = Vec::with_capacity(
-            self.data.len() - (range.end - range.start)
+            self.data().len() - (range.end - range.start)
                 // Each key might have a different size, so just allocate an arbitrary size to
                 // prevent more allocations. I picked 32 bytes as I don't expect hashes (hence
                 // keys) to be bigger that that
                 + keys.len() * (KEY_SIZE_BYTE + FILE_OFFSET_BYTES + 32),
         );
 
-        result.extend_from_slice(&self.data[0..range.start]);
+        result.extend_from_slice(&self.data()[0..range.start]);
         for (key, file_offset) in keys {
             extend_with_offset_and_key(&mut result, key, *file_offset);
         }
-        result.extend_from_slice(&self.data[range.end..]);
+        result.extend_from_slice(&self.data()[range.end..]);
 
         result
     }
@@ -120,29 +130,29 @@ impl<'a> RecordList<'a> {
     /// The given position must point to the first byte where the record starts.
     pub fn read_record(&self, pos: usize) -> Record {
         let size_offset = pos + FILE_OFFSET_BYTES;
-        let file_offset: [u8; 8] = self.data[pos..size_offset]
+        let file_offset: [u8; 8] = self.data()[pos..size_offset]
             .try_into()
             .expect("This slice always has the correct size.");
-        let size = usize::from(self.data[size_offset]);
+        let size = usize::from(self.data()[size_offset]);
         Record {
             pos,
-            key: &self.data[size_offset + KEY_SIZE_BYTE..size_offset + KEY_SIZE_BYTE + size],
+            key: &self.data()[size_offset + KEY_SIZE_BYTE..size_offset + KEY_SIZE_BYTE + size],
             file_offset: u64::from_le_bytes(file_offset),
         }
     }
 
     /// The length of the record list.
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.data().len()
     }
 
     /// Returns true if the record list is empty.
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.data().is_empty()
     }
 }
 
-impl<'a> IntoIterator for &'a RecordList<'a> {
+impl<'a> IntoIterator for &'a RecordList {
     type Item = Record<'a>;
     type IntoIter = RecordListIter<'a>;
 
@@ -158,7 +168,7 @@ impl<'a> IntoIterator for &'a RecordList<'a> {
 #[derive(Debug)]
 pub struct RecordListIter<'a> {
     /// The data we are iterating over
-    records: &'a RecordList<'a>,
+    records: &'a RecordList,
     /// The current position within the data
     pos: usize,
 }
@@ -167,7 +177,7 @@ impl<'a> Iterator for RecordListIter<'a> {
     type Item = Record<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.records.data.len() {
+        if self.pos >= self.records.data().len() {
             return None;
         }
 

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use rand::RngCore;
@@ -21,16 +23,25 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             BenchmarkId::new("put", format!("{}-{}", key_size, value_size)),
             &(key_size, value_size),
             |b, &(key_size, value_size)| {
-                let mut key = vec![0u8; key_size];
-                let mut value = vec![0u8; value_size];
                 let mut rng = rand::thread_rng();
 
-                b.iter(|| {
-                    rng.fill_bytes(&mut key);
-                    rng.fill_bytes(&mut value);
-                    db.put(&key, &value).unwrap();
-                    black_box(&key);
-                })
+                b.iter_custom(|iters| {
+                    let data = (0..iters)
+                        .map(|_| {
+                            let mut key = vec![0u8; key_size];
+                            let mut value = vec![0u8; value_size];
+                            rng.fill_bytes(&mut key);
+                            rng.fill_bytes(&mut value);
+                            (key, value)
+                        })
+                        .collect::<Vec<_>>();
+
+                    let start = Instant::now();
+                    for i in 0..iters {
+                        black_box(db.put(&data[i as usize].0, &data[i as usize].1).unwrap());
+                    }
+                    start.elapsed()
+                });
             },
         );
     }

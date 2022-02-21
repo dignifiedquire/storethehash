@@ -30,6 +30,7 @@ impl<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> Db<P, I, N> {
         let index = Index::<_, _, N>::new(storage, primary)?;
         Ok(Self { index })
     }
+
     /// Returns the value of the given key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let index_key = P::index_key(&key)?;

@@ -14,6 +14,7 @@ thiserror = "1.0.22"
 log = "0.4.11"
 io-streams = "0.11.0"
 system-interface = "0.20.0"
+bytes = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3.1.0"

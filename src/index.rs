@@ -15,6 +15,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufWriter, SeekFrom, Write};
 use std::path::Path;
 
+use bytes::Bytes;
 use log::{debug, warn};
 use system_interface::fs::FileIoExt;
 
@@ -77,19 +78,19 @@ impl From<&[u8]> for Header {
 
 pub trait IndexStorage<const N: u8> {
     fn load_buckets(&self) -> Result<Buckets<N>, Error>;
-    fn get_record_list_buffer(&self, pos: u64) -> Result<Vec<u8>, Error>;
-    fn write_record_list(&self, bucket: u32, data: &[u8]) -> Result<u64, Error>;
+    fn get_record_list_buffer(&self, pos: u64) -> Result<RecordList, Error>;
+    fn write_record_list(&self, bucket: u32, data: Vec<u8>) -> Result<u64, Error>;
 }
 
 pub struct IndexMemoryStorage<const N: u8> {
-    records: RefCell<Vec<Vec<u8>>>,
+    records: RefCell<Vec<(u32, Bytes)>>,
 }
 
 impl<const N: u8> IndexMemoryStorage<N> {
     pub fn new() -> Self {
         IndexMemoryStorage {
             // empty record at the beginning to avoid index_offset 0
-            records: RefCell::new(vec![vec![0u8]]),
+            records: RefCell::new(vec![(0, Bytes::new())]),
         }
     }
 }
@@ -99,18 +100,14 @@ impl<const N: u8> IndexStorage<N> for IndexMemoryStorage<N> {
         Ok(Buckets::new())
     }
 
-    fn get_record_list_buffer(&self, pos: u64) -> Result<Vec<u8>, Error> {
+    fn get_record_list_buffer(&self, pos: u64) -> Result<RecordList, Error> {
         let pos = usize::try_from(pos).unwrap();
-        Ok(self.records.borrow()[pos].clone())
+        Ok(RecordList::owned(self.records.borrow()[pos].1.clone()))
     }
 
-    fn write_record_list(&self, bucket: u32, data: &[u8]) -> Result<u64, Error> {
+    fn write_record_list(&self, bucket: u32, data: Vec<u8>) -> Result<u64, Error> {
         let pos = self.records.borrow().len();
-        let mut buf = vec![0u8; BUCKET_PREFIX_SIZE + data.len()];
-        buf[..BUCKET_PREFIX_SIZE].copy_from_slice(&bucket.to_le_bytes());
-        buf[BUCKET_PREFIX_SIZE..].copy_from_slice(data);
-
-        self.records.borrow_mut().push(buf);
+        self.records.borrow_mut().push((bucket, Bytes::from(data)));
         Ok(pos as u64)
     }
 }
@@ -165,7 +162,7 @@ impl<const N: u8> IndexStorage<N> for IndexFileStorage<N> {
         Ok(buckets)
     }
 
-    fn get_record_list_buffer(&self, pos: u64) -> Result<Vec<u8>, Error> {
+    fn get_record_list_buffer(&self, pos: u64) -> Result<RecordList, Error> {
         let mut reader = self.file.borrow_mut();
         let mut recordlist_size_buffer = [0; 4];
         reader.get_mut().seek(SeekFrom::Start(pos))?;
@@ -176,10 +173,10 @@ impl<const N: u8> IndexStorage<N> for IndexFileStorage<N> {
 
         let mut data = vec![0u8; recordlist_size];
         reader.get_ref().read_exact(&mut data)?;
-        Ok(data)
+        Ok(RecordList::new(&data))
     }
 
-    fn write_record_list(&self, bucket: u32, data: &[u8]) -> Result<u64, Error> {
+    fn write_record_list(&self, bucket: u32, data: Vec<u8>) -> Result<u64, Error> {
         let writer = &mut *self.file.borrow_mut();
         let recordlist_pos = writer
             .get_mut()
@@ -298,8 +295,7 @@ impl<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> Index<P, I, N> {
         }
         // Read the record list from disk and insert the new key
         else {
-            let data = self.storage.get_record_list_buffer(index_offset)?;
-            let records = RecordList::new(&data);
+            let records = self.storage.get_record_list_buffer(index_offset)?;
             let (pos, prev_record) = records.find_key_position(index_key);
 
             match prev_record {
@@ -376,12 +372,13 @@ impl<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> Index<P, I, N> {
             }
         };
 
-        let record_list_pos = self.storage.write_record_list(bucket, &new_data)?;
+        let record_list_pos = self.storage.write_record_list(bucket, new_data)?;
 
         // Keep the reference to the stored data in the bucket
         self.buckets
             .borrow_mut()
             .put(bucket as usize, record_list_pos)?;
+
         Ok(())
     }
 
@@ -409,8 +406,7 @@ impl<P: PrimaryStorage, I: IndexStorage<N>, const N: u8> Index<P, I, N> {
         // Read the record list from disk and get the file offset of that key in the primary
         // storage.
         else {
-            let data = self.storage.get_record_list_buffer(index_offset)?;
-            let records = RecordList::new(&data);
+            let records = self.storage.get_record_list_buffer(index_offset)?;
             let file_offset = records.get(index_key);
             Ok(file_offset)
         }
